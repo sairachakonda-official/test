@@ -335,3 +335,45 @@ stats = merger.merge(
 )
 
 print(stats)
+
+
+
+
+import os
+import duckdb
+
+
+def merge_parquet_files(
+    input_folder: str,
+    output_file: str,
+    compression: str = "SNAPPY",
+    threads: int = 8,
+    memory_limit: str = "16GB",
+    delete_source: bool = False,
+) -> None:
+    con = duckdb.connect()
+
+    con.execute(f"SET threads={threads}")
+    con.execute(f"SET memory_limit='{memory_limit}'")
+
+    parquet_path = os.path.join(input_folder, "*.parquet").replace("\\", "/")
+    output_file = output_file.replace("\\", "/")
+
+    con.execute(f"""
+        COPY (
+            SELECT *
+            FROM read_parquet('{parquet_path}')
+        )
+        TO '{output_file}'
+        (FORMAT PARQUET, COMPRESSION {compression});
+    """)
+
+    con.close()
+
+    if delete_source:
+        for file in os.listdir(input_folder):
+            if file.endswith(".parquet"):
+                os.remove(os.path.join(input_folder, file))
+
+        if not os.listdir(input_folder):
+            os.rmdir(input_folder)
