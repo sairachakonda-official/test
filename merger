@@ -7,11 +7,18 @@ import threading
 
 class DuckDBMerger:
 
-    def __init__(self,memory_usage_percent=70,threads=None,temp_directory="duckdb_temp"):
+    def __init__(
+        self,
+        memory_usage_percent=70,
+        threads=None,
+        temp_directory="duckdb_temp",
+        verbose=True
+    ):
 
         self.memory_usage_percent=memory_usage_percent
         self.threads=threads if threads else max(os.cpu_count()-1,1)
         self.temp_directory=temp_directory
+        self.verbose=verbose
 
         available_gb=psutil.virtual_memory().available/(1024**3)
         usable_gb=max(int(available_gb*memory_usage_percent/100),1)
@@ -23,16 +30,21 @@ class DuckDBMerger:
         self.max_memory_used=0
 
     # =====================================================
+    # CONDITIONAL PRINT
+    # =====================================================
+
+    def log(self,*args,**kwargs):
+
+        if self.verbose:
+            print(*args,**kwargs)
+
+    # =====================================================
     # FILE READER
     # =====================================================
 
     def get_reader(self,file_path,file_type,delimiter=None):
 
         file_type=file_type.lower()
-
-        # =================================================
-        # TXT
-        # =================================================
 
         if file_type=="txt":
 
@@ -41,16 +53,12 @@ class DuckDBMerger:
             return f"""
             read_csv_auto(
                 '{file_path}',
-                delim='{delimiter}',
-                sample_size=-1,
+                sep='{delimiter}',
+                header=true,
                 ignore_errors=true,
-                header=true
+                sample_size=200000
             )
             """
-
-        # =================================================
-        # CSV
-        # =================================================
 
         if file_type=="csv":
 
@@ -59,16 +67,12 @@ class DuckDBMerger:
             return f"""
             read_csv_auto(
                 '{file_path}',
-                delim='{delimiter}',
-                sample_size=-1,
+                sep='{delimiter}',
+                header=true,
                 ignore_errors=true,
-                header=true
+                sample_size=200000
             )
             """
-
-        # =================================================
-        # PARQUET
-        # =================================================
 
         if file_type=="parquet":
 
@@ -89,7 +93,6 @@ class DuckDBMerger:
         con.execute(f"SET memory_limit='{self.memory_limit}'")
         con.execute(f"SET threads={self.threads}")
         con.execute(f"SET temp_directory='{self.temp_directory}'")
-        con.execute("PRAGMA enable_progress_bar")
 
         return con
 
@@ -148,7 +151,9 @@ class DuckDBMerger:
         select_columns="*",
         where_condition=None,
         compression="zstd",
-        append=False
+        append=False,
+        show_stats=True,
+        show_summary=True
     ):
 
         join_type=join_type.upper()
@@ -186,19 +191,21 @@ class DuckDBMerger:
         {where_clause}
         """
 
-        print("\n====================")
-        print("MERGE STARTED")
-        print("====================")
+        if show_stats:
 
-        print(f"Memory Limit    : {self.memory_limit}")
-        print(f"Threads         : {self.threads}")
-        print(f"Join Type       : {join_type}")
-        print(f"Append Mode     : {append}")
+            self.log("\nMERGE STARTED")
 
-        print("\nInitial Stats")
+            self.log(
+                f"Memory Limit : {self.memory_limit}"
+            )
 
-        for k,v in self.stats().items():
-            print(f"{k:<20}: {v:.2f}")
+            self.log(
+                f"Threads      : {self.threads}"
+            )
+
+            self.log(
+                f"Join Type    : {join_type}"
+            )
 
         start=time.time()
 
@@ -280,12 +287,13 @@ class DuckDBMerger:
                     (
                         FORMAT CSV,
                         HEADER,
+                        FORCE_QUOTE *,
                         DELIMITER '{output_delimiter}'
                     )
                     """)
 
-                    with open(output_file,"a") as main_file:
-                        with open(temp_file,"r") as temp:
+                    with open(output_file,"a",encoding="utf-8") as main_file:
+                        with open(temp_file,"r",encoding="utf-8") as temp:
 
                             next(temp)
 
@@ -304,6 +312,7 @@ class DuckDBMerger:
                     (
                         FORMAT CSV,
                         HEADER,
+                        FORCE_QUOTE *,
                         DELIMITER '{output_delimiter}'
                     )
                     """)
@@ -324,27 +333,36 @@ class DuckDBMerger:
 
         elapsed_minutes=(time.time()-start)/60
 
-        print("\nFinal Stats")
-
-        for k,v in self.stats().items():
-            print(f"{k:<20}: {v:.2f}")
-
         output_size_gb=os.path.getsize(output_file)/(1024**3)
 
-        print("\n====================")
-        print("MERGE COMPLETED")
-        print("====================")
+        # =====================================================
+        # SUMMARY
+        # =====================================================
 
-        print(f"Output File      : {output_file}")
-        print(f"Output Size      : {output_size_gb:.2f} GB")
-        print(f"Time Taken       : {elapsed_minutes:.2f} minutes")
+        if show_summary:
 
-        print(
-            f"Max Memory Usage : "
-            f"{self.max_memory_used:.2f} GB"
-        )
+            self.log("\nMERGE COMPLETED")
 
-        print("====================\n")
+            self.log(
+                f"Output File      : {output_file}"
+            )
+
+            self.log(
+                f"Output Size      : "
+                f"{output_size_gb:.2f} GB"
+            )
+
+            self.log(
+                f"Time Taken       : "
+                f"{elapsed_minutes:.2f} minutes"
+            )
+
+            self.log(
+                f"Max Memory Usage : "
+                f"{self.max_memory_used:.2f} GB"
+            )
+
+        return output_file
 
 
 # =====================================================
@@ -353,7 +371,8 @@ class DuckDBMerger:
 
 merger=DuckDBMerger(
     memory_usage_percent=75,
-    threads=8
+    threads=8,
+    verbose=True
 )
 
 merger.merge(
@@ -366,14 +385,7 @@ merger.merge(
     left_file_type="txt",
     right_file_type="csv",
     output_file_type="txt",
-    left_delimiter="\t",
-    right_delimiter=",",
-    output_delimiter="\t",
-    select_columns="""
-    l.customer_id,
-    l.sales_amount,
-    r.customer_name
-    """,
-    where_condition="l.sales_amount > 100",
-    append=True
+    append=True,
+    show_stats=False,
+    show_summary=True
 )
