@@ -1,7 +1,8 @@
-import duckdb
-import psutil
 import os
 import time
+import duckdb
+import psutil
+import threading
 
 
 class UltraFastDuckDBMerger:
@@ -13,28 +14,21 @@ class UltraFastDuckDBMerger:
         temp_directory="duckdb_temp",
         verbose=True
     ):
+        self.verbose = verbose
+        self.threads = threads or os.cpu_count()
 
-        self.verbose=verbose
-
-        self.threads=threads or os.cpu_count()
-
-        available_gb=(
-            psutil.virtual_memory().available
-            /(1024**3)
+        available_gb = (
+            psutil.virtual_memory().available / (1024 ** 3)
         )
 
-        usable_gb=max(
-            int(
-                available_gb
-                * memory_usage_percent
-                /100
-            ),
+        usable_gb = max(
+            int(available_gb * memory_usage_percent / 100),
             1
         )
 
-        self.memory_limit=f"{usable_gb}GB"
+        self.memory_limit = f"{usable_gb}GB"
 
-        self.temp_directory=temp_directory
+        self.temp_directory = temp_directory
 
         os.makedirs(
             temp_directory,
@@ -45,10 +39,37 @@ class UltraFastDuckDBMerger:
     # LOGGER
     # =====================================================
 
-    def log(self,*args):
+    def log(self, *args):
 
         if self.verbose:
             print(*args)
+
+    # =====================================================
+    # MEMORY MONITOR
+    # =====================================================
+
+    def monitor_memory(
+        self,
+        stop_event,
+        interval=0.1
+    ):
+        process = psutil.Process(os.getpid())
+
+        self.max_memory_used_bytes = 0
+
+        while not stop_event.is_set():
+
+            try:
+
+                memory = process.memory_info().rss
+
+                if memory > self.max_memory_used_bytes:
+                    self.max_memory_used_bytes = memory
+
+            except Exception:
+                pass
+
+            time.sleep(interval)
 
     # =====================================================
     # CONNECTION
@@ -56,11 +77,7 @@ class UltraFastDuckDBMerger:
 
     def connect(self):
 
-        con=duckdb.connect()
-
-        # -------------------------------------------------
-        # MEMORY + THREADS
-        # -------------------------------------------------
+        con = duckdb.connect()
 
         con.execute(
             f"SET memory_limit='{self.memory_limit}'"
@@ -73,10 +90,6 @@ class UltraFastDuckDBMerger:
         con.execute(
             f"SET temp_directory='{self.temp_directory}'"
         )
-
-        # -------------------------------------------------
-        # PERFORMANCE SETTINGS
-        # -------------------------------------------------
 
         con.execute(
             "SET preserve_insertion_order=false"
@@ -103,39 +116,17 @@ class UltraFastDuckDBMerger:
         delimiter=None
     ):
 
-        file_type=file_type.lower()
+        file_type = file_type.lower()
 
-        # -------------------------------------------------
-        # PARQUET
-        # -------------------------------------------------
+        if file_type == "parquet":
 
-        if file_type=="parquet":
-
-            return f"""
-            read_parquet(
-                '{file_path}'
+            return (
+                f"read_parquet('{file_path}')"
             )
-            """
 
-        # -------------------------------------------------
-        # TXT
-        # -------------------------------------------------
-
-        if file_type=="txt":
-
-            delimiter=delimiter or "\t"
-
-        # -------------------------------------------------
-        # CSV
-        # -------------------------------------------------
-
-        else:
-
-            delimiter=delimiter or ","
-
-        # -------------------------------------------------
-        # FAST CSV READER
-        # -------------------------------------------------
+        delimiter = delimiter or (
+            "\t" if file_type == "txt" else ","
+        )
 
         return f"""
         read_csv(
@@ -171,48 +162,56 @@ class UltraFastDuckDBMerger:
         compression="SNAPPY"
     ):
 
-        start=time.time()
+        start = time.time()
 
-        con=self.connect()
+        stop_event = threading.Event()
 
-        left_reader=self.get_reader(
+        memory_thread = threading.Thread(
+            target=self.monitor_memory,
+            args=(stop_event,),
+            daemon=True
+        )
+
+        memory_thread.start()
+
+        con = self.connect()
+
+        left_reader = self.get_reader(
             left_file,
             left_file_type,
             left_delimiter
         )
 
-        right_reader=self.get_reader(
+        right_reader = self.get_reader(
             right_file,
             right_file_type,
             right_delimiter
         )
 
-        where_clause=(
+        where_clause = (
             f"WHERE {where_condition}"
             if where_condition else ""
         )
 
-        # =================================================
-        # QUERY
-        # =================================================
-
-        query=f"""
-        COPY (
-
-            SELECT {select_columns}
-
-            FROM {left_reader} l
-
-            {join_type} JOIN {right_reader} r
-
-            ON l.{left_join_key}=r.{right_join_key}
-
-            {where_clause}
-
+        left_size_gb = (
+            os.path.getsize(left_file) /
+            (1024 ** 3)
         )
 
-        TO '{output_file}'
+        right_size_gb = (
+            os.path.getsize(right_file) /
+            (1024 ** 3)
+        )
 
+        query = f"""
+        COPY (
+            SELECT {select_columns}
+            FROM {left_reader} l
+            {join_type} JOIN {right_reader} r
+            ON l.{left_join_key}=r.{right_join_key}
+            {where_clause}
+        )
+        TO '{output_file}'
         (
             FORMAT PARQUET,
             COMPRESSION {compression},
@@ -220,41 +219,108 @@ class UltraFastDuckDBMerger:
         )
         """
 
-        self.log("Running ultra fast merge...")
+        self.log(
+            "Running ultra fast merge..."
+        )
 
         con.execute(query)
 
+        output_rows = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_parquet('{output_file}')
+            """
+        ).fetchone()[0]
+
         con.close()
 
-        elapsed=(time.time()-start)/60
+        stop_event.set()
 
-        output_size=(
-            os.path.getsize(output_file)
-            /(1024**3)
+        memory_thread.join()
+
+        elapsed_seconds = (
+            time.time() - start
         )
 
-        self.log(
-            f"Completed in {elapsed:.2f} minutes"
+        output_size_gb = (
+            os.path.getsize(output_file) /
+            (1024 ** 3)
         )
 
-        self.log(
-            f"Output Size : {output_size:.2f} GB"
+        max_memory_used_gb = (
+            self.max_memory_used_bytes /
+            (1024 ** 3)
         )
 
-        return output_file
+        stats = {
+
+            "status": "success",
+
+            "join_type": join_type,
+
+            "left_file": left_file,
+
+            "right_file": right_file,
+
+            "left_file_type": left_file_type,
+
+            "right_file_type": right_file_type,
+
+            "left_file_size_gb": round(
+                left_size_gb,
+                2
+            ),
+
+            "right_file_size_gb": round(
+                right_size_gb,
+                2
+            ),
+
+            "output_file": output_file,
+
+            "output_size_gb": round(
+                output_size_gb,
+                2
+            ),
+
+            "output_rows": output_rows,
+
+            "execution_time_seconds": round(
+                elapsed_seconds,
+                2
+            ),
+
+            "execution_time_minutes": round(
+                elapsed_seconds / 60,
+                2
+            ),
+
+            "max_memory_used_gb": round(
+                max_memory_used_gb,
+                2
+            ),
+
+            "memory_limit": self.memory_limit,
+
+            "threads_used": self.threads,
+
+            "compression": compression
+        }
+
+        return stats
 
 
 # =====================================================
 # EXAMPLE
 # =====================================================
 
-merger=UltraFastDuckDBMerger(
+merger = UltraFastDuckDBMerger(
     memory_usage_percent=95,
     threads=os.cpu_count(),
     verbose=True
 )
 
-merger.merge(
+stats = merger.merge(
     left_file="sales.csv",
     right_file="customers.txt",
     output_file="final_output.parquet",
@@ -267,3 +333,5 @@ merger.merge(
     right_delimiter="\t",
     compression="SNAPPY"
 )
+
+print(stats)
