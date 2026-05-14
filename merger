@@ -1,0 +1,282 @@
+import duckdb
+import psutil
+import time
+import os
+import threading
+
+
+class DuckDBMerger:
+
+    def __init__(self,memory_usage_percent=70,threads=None,temp_directory="duckdb_temp"):
+
+        self.memory_usage_percent=memory_usage_percent
+        self.threads=threads if threads else max(os.cpu_count()-1,1)
+        self.temp_directory=temp_directory
+
+        available_gb=psutil.virtual_memory().available/(1024**3)
+        usable_gb=max(int(available_gb*memory_usage_percent/100),1)
+
+        self.memory_limit=f"{usable_gb}GB"
+
+        os.makedirs(temp_directory,exist_ok=True)
+
+        self.max_memory_used=0
+
+    def get_reader(self,file_path,file_type):
+
+        file_type=file_type.lower()
+
+        if file_type=="csv":
+            return f"read_csv_auto('{file_path}',sample_size=-1,ignore_errors=true)"
+
+        if file_type=="parquet":
+            return f"read_parquet('{file_path}')"
+
+        raise ValueError("Supported types: csv, parquet")
+
+    def connect(self):
+
+        con=duckdb.connect()
+
+        con.execute(f"SET memory_limit='{self.memory_limit}'")
+        con.execute(f"SET threads={self.threads}")
+        con.execute(f"SET temp_directory='{self.temp_directory}'")
+        con.execute("PRAGMA enable_progress_bar")
+
+        return con
+
+    def stats(self):
+
+        process=psutil.Process(os.getpid())
+
+        return {
+            "CPU %":psutil.cpu_percent(interval=1),
+            "Process RAM GB":process.memory_info().rss/(1024**3),
+            "Available RAM GB":psutil.virtual_memory().available/(1024**3)
+        }
+
+    # =====================================================
+    # MEMORY MONITOR
+    # =====================================================
+
+    def monitor_memory(self,stop_event):
+
+        process=psutil.Process(os.getpid())
+
+        while not stop_event.is_set():
+
+            current_memory=(
+                process.memory_info().rss
+                /(1024**3)
+            )
+
+            if current_memory>self.max_memory_used:
+                self.max_memory_used=current_memory
+
+            time.sleep(0.5)
+
+    # =====================================================
+    # MERGE
+    # =====================================================
+
+    def merge(
+        self,
+        left_file,
+        right_file,
+        output_file,
+        left_join_key,
+        right_join_key,
+        join_type="LEFT",
+        left_file_type="csv",
+        right_file_type="csv",
+        output_file_type="parquet",
+        select_columns="*",
+        where_condition=None,
+        compression="zstd",
+        append=False
+    ):
+
+        join_type=join_type.upper()
+
+        left_reader=self.get_reader(left_file,left_file_type)
+        right_reader=self.get_reader(right_file,right_file_type)
+
+        where_clause=f"WHERE {where_condition}" if where_condition else ""
+
+        query=f"""
+        SELECT {select_columns}
+        FROM {left_reader} l
+        {join_type} JOIN {right_reader} r
+        ON l.{left_join_key}=r.{right_join_key}
+        {where_clause}
+        """
+
+        print("\n====================")
+        print("MERGE STARTED")
+        print("====================")
+
+        print(f"Memory Limit : {self.memory_limit}")
+        print(f"Threads      : {self.threads}")
+        print(f"Join Type    : {join_type}")
+        print(f"Append Mode  : {append}")
+
+        print("\nInitial Stats")
+
+        for k,v in self.stats().items():
+            print(f"{k:<20}: {v:.2f}")
+
+        start=time.time()
+
+        # =================================================
+        # START MEMORY MONITOR
+        # =================================================
+
+        stop_event=threading.Event()
+
+        monitor_thread=threading.Thread(
+            target=self.monitor_memory,
+            args=(stop_event,)
+        )
+
+        monitor_thread.start()
+
+        con=self.connect()
+
+        try:
+
+            # =================================================
+            # PARQUET OUTPUT
+            # =================================================
+
+            if output_file_type.lower()=="parquet":
+
+                if append and os.path.exists(output_file):
+
+                    temp_table="temp_merge_table"
+
+                    con.execute(f"""
+                    CREATE TEMP TABLE {temp_table} AS
+                    {query}
+                    """)
+
+                    con.execute(f"""
+                    COPY (
+                        SELECT * FROM read_parquet('{output_file}')
+                        UNION ALL
+                        SELECT * FROM {temp_table}
+                    )
+                    TO '{output_file}'
+                    (FORMAT PARQUET, COMPRESSION '{compression}')
+                    """)
+
+                else:
+
+                    con.execute(f"""
+                    COPY (
+                        {query}
+                    )
+                    TO '{output_file}'
+                    (FORMAT PARQUET, COMPRESSION '{compression}')
+                    """)
+
+            # =================================================
+            # CSV OUTPUT
+            # =================================================
+
+            elif output_file_type.lower()=="csv":
+
+                if append and os.path.exists(output_file):
+
+                    temp_file=f"{output_file}.tmp.csv"
+
+                    con.execute(f"""
+                    COPY (
+                        {query}
+                    )
+                    TO '{temp_file}'
+                    (FORMAT CSV, HEADER)
+                    """)
+
+                    with open(output_file,"a") as main_file:
+                        with open(temp_file,"r") as temp:
+
+                            next(temp)
+
+                            for line in temp:
+                                main_file.write(line)
+
+                    os.remove(temp_file)
+
+                else:
+
+                    con.execute(f"""
+                    COPY (
+                        {query}
+                    )
+                    TO '{output_file}'
+                    (FORMAT CSV, HEADER)
+                    """)
+
+            else:
+
+                raise ValueError(
+                    "Supported output: csv, parquet"
+                )
+
+        finally:
+
+            con.close()
+
+            stop_event.set()
+
+            monitor_thread.join()
+
+        elapsed_minutes=(time.time()-start)/60
+
+        print("\nFinal Stats")
+
+        for k,v in self.stats().items():
+            print(f"{k:<20}: {v:.2f}")
+
+        output_size_gb=os.path.getsize(output_file)/(1024**3)
+
+        print("\n====================")
+        print("MERGE COMPLETED")
+        print("====================")
+
+        print(f"Output File      : {output_file}")
+        print(f"Output Size      : {output_size_gb:.2f} GB")
+        print(f"Time Taken       : {elapsed_minutes:.2f} minutes")
+
+        print(
+            f"Max Memory Usage : "
+            f"{self.max_memory_used:.2f} GB"
+        )
+
+        print("====================\n")
+
+
+# =====================================================
+# EXAMPLE
+# =====================================================
+
+merger=DuckDBMerger(memory_usage_percent=75,threads=8)
+
+merger.merge(
+    left_file="sales.csv",
+    right_file="customers.parquet",
+    output_file="final_output.parquet",
+    left_join_key="customer_id",
+    right_join_key="cust_id",
+    join_type="LEFT",
+    left_file_type="csv",
+    right_file_type="parquet",
+    output_file_type="parquet",
+    select_columns="""
+    l.customer_id,
+    l.sales_amount,
+    r.customer_name
+    """,
+    where_condition="l.sales_amount > 100",
+    append=True
+)
