@@ -22,17 +22,65 @@ class DuckDBMerger:
 
         self.max_memory_used=0
 
-    def get_reader(self,file_path,file_type):
+    # =====================================================
+    # FILE READER
+    # =====================================================
+
+    def get_reader(self,file_path,file_type,delimiter=None):
 
         file_type=file_type.lower()
 
+        # =================================================
+        # TXT
+        # =================================================
+
+        if file_type=="txt":
+
+            delimiter=delimiter or "\t"
+
+            return f"""
+            read_csv_auto(
+                '{file_path}',
+                delim='{delimiter}',
+                sample_size=-1,
+                ignore_errors=true,
+                header=true
+            )
+            """
+
+        # =================================================
+        # CSV
+        # =================================================
+
         if file_type=="csv":
-            return f"read_csv_auto('{file_path}',sample_size=-1,ignore_errors=true)"
+
+            delimiter=delimiter or ","
+
+            return f"""
+            read_csv_auto(
+                '{file_path}',
+                delim='{delimiter}',
+                sample_size=-1,
+                ignore_errors=true,
+                header=true
+            )
+            """
+
+        # =================================================
+        # PARQUET
+        # =================================================
 
         if file_type=="parquet":
+
             return f"read_parquet('{file_path}')"
 
-        raise ValueError("Supported types: csv, parquet")
+        raise ValueError(
+            "Supported types: csv, txt, parquet"
+        )
+
+    # =====================================================
+    # CONNECTION
+    # =====================================================
 
     def connect(self):
 
@@ -44,6 +92,10 @@ class DuckDBMerger:
         con.execute("PRAGMA enable_progress_bar")
 
         return con
+
+    # =====================================================
+    # STATS
+    # =====================================================
 
     def stats(self):
 
@@ -90,6 +142,9 @@ class DuckDBMerger:
         left_file_type="csv",
         right_file_type="csv",
         output_file_type="parquet",
+        left_delimiter=None,
+        right_delimiter=None,
+        output_delimiter=None,
         select_columns="*",
         where_condition=None,
         compression="zstd",
@@ -98,10 +153,30 @@ class DuckDBMerger:
 
         join_type=join_type.upper()
 
-        left_reader=self.get_reader(left_file,left_file_type)
-        right_reader=self.get_reader(right_file,right_file_type)
+        valid_joins=["LEFT","RIGHT","INNER","FULL"]
 
-        where_clause=f"WHERE {where_condition}" if where_condition else ""
+        if join_type not in valid_joins:
+
+            raise ValueError(
+                f"join_type must be one of {valid_joins}"
+            )
+
+        left_reader=self.get_reader(
+            left_file,
+            left_file_type,
+            left_delimiter
+        )
+
+        right_reader=self.get_reader(
+            right_file,
+            right_file_type,
+            right_delimiter
+        )
+
+        where_clause=(
+            f"WHERE {where_condition}"
+            if where_condition else ""
+        )
 
         query=f"""
         SELECT {select_columns}
@@ -115,10 +190,10 @@ class DuckDBMerger:
         print("MERGE STARTED")
         print("====================")
 
-        print(f"Memory Limit : {self.memory_limit}")
-        print(f"Threads      : {self.threads}")
-        print(f"Join Type    : {join_type}")
-        print(f"Append Mode  : {append}")
+        print(f"Memory Limit    : {self.memory_limit}")
+        print(f"Threads         : {self.threads}")
+        print(f"Join Type       : {join_type}")
+        print(f"Append Mode     : {append}")
 
         print("\nInitial Stats")
 
@@ -126,10 +201,6 @@ class DuckDBMerger:
             print(f"{k:<20}: {v:.2f}")
 
         start=time.time()
-
-        # =================================================
-        # START MEMORY MONITOR
-        # =================================================
 
         stop_event=threading.Event()
 
@@ -166,7 +237,10 @@ class DuckDBMerger:
                         SELECT * FROM {temp_table}
                     )
                     TO '{output_file}'
-                    (FORMAT PARQUET, COMPRESSION '{compression}')
+                    (
+                        FORMAT PARQUET,
+                        COMPRESSION '{compression}'
+                    )
                     """)
 
                 else:
@@ -176,25 +250,38 @@ class DuckDBMerger:
                         {query}
                     )
                     TO '{output_file}'
-                    (FORMAT PARQUET, COMPRESSION '{compression}')
+                    (
+                        FORMAT PARQUET,
+                        COMPRESSION '{compression}'
+                    )
                     """)
 
             # =================================================
-            # CSV OUTPUT
+            # CSV / TXT OUTPUT
             # =================================================
 
-            elif output_file_type.lower()=="csv":
+            elif output_file_type.lower() in ["csv","txt"]:
+
+                if output_file_type.lower()=="txt":
+                    output_delimiter=output_delimiter or "\t"
+
+                else:
+                    output_delimiter=output_delimiter or ","
 
                 if append and os.path.exists(output_file):
 
-                    temp_file=f"{output_file}.tmp.csv"
+                    temp_file=f"{output_file}.tmp"
 
                     con.execute(f"""
                     COPY (
                         {query}
                     )
                     TO '{temp_file}'
-                    (FORMAT CSV, HEADER)
+                    (
+                        FORMAT CSV,
+                        HEADER,
+                        DELIMITER '{output_delimiter}'
+                    )
                     """)
 
                     with open(output_file,"a") as main_file:
@@ -214,13 +301,17 @@ class DuckDBMerger:
                         {query}
                     )
                     TO '{output_file}'
-                    (FORMAT CSV, HEADER)
+                    (
+                        FORMAT CSV,
+                        HEADER,
+                        DELIMITER '{output_delimiter}'
+                    )
                     """)
 
             else:
 
                 raise ValueError(
-                    "Supported output: csv, parquet"
+                    "Supported output: csv, txt, parquet"
                 )
 
         finally:
@@ -260,18 +351,24 @@ class DuckDBMerger:
 # EXAMPLE
 # =====================================================
 
-merger=DuckDBMerger(memory_usage_percent=75,threads=8)
+merger=DuckDBMerger(
+    memory_usage_percent=75,
+    threads=8
+)
 
 merger.merge(
-    left_file="sales.csv",
-    right_file="customers.parquet",
-    output_file="final_output.parquet",
+    left_file="sales.txt",
+    right_file="customers.csv",
+    output_file="final_output.txt",
     left_join_key="customer_id",
     right_join_key="cust_id",
     join_type="LEFT",
-    left_file_type="csv",
-    right_file_type="parquet",
-    output_file_type="parquet",
+    left_file_type="txt",
+    right_file_type="csv",
+    output_file_type="txt",
+    left_delimiter="\t",
+    right_delimiter=",",
+    output_delimiter="\t",
     select_columns="""
     l.customer_id,
     l.sales_amount,
