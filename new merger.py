@@ -60,7 +60,7 @@ CLEAN_AFTER_JOIN = True
 
 CLEAN_AFTER_MERGE = False
 
-GC_INTERVAL = 20
+GC_INTERVAL = 5
 
 
 # =========================================================
@@ -116,11 +116,15 @@ def log(message):
 
 
 # =========================================================
-# THREAD LOCAL CONNECTION
+# THREAD LOCAL
 # =========================================================
 
 thread_local = threading.local()
 
+
+# =========================================================
+# CONNECTION
+# =========================================================
 
 def get_connection():
 
@@ -166,6 +170,29 @@ def close_thread_connection():
                 pass
 
             del thread_local.con
+
+    except:
+        pass
+
+
+# =========================================================
+# GLOBAL CLEANUP
+# =========================================================
+
+SCHEMA_CACHE = {}
+
+
+def force_cleanup():
+
+    try:
+
+        close_thread_connection()
+
+        thread_local.__dict__.clear()
+
+        SCHEMA_CACHE.clear()
+
+        gc.collect()
 
     except:
         pass
@@ -220,9 +247,11 @@ def safe_remove(path):
     try:
 
         if os.path.isfile(path):
+
             os.remove(path)
 
         elif os.path.isdir(path):
+
             shutil.rmtree(path)
 
     except Exception as e:
@@ -230,10 +259,6 @@ def safe_remove(path):
         log(f"Cleanup Failed : {path}")
         log(str(e))
 
-
-# =========================================================
-# MEMORY
-# =========================================================
 
 def clean_memory(*variables):
 
@@ -253,11 +278,8 @@ def clean_memory(*variables):
 
 
 # =========================================================
-# SCHEMA CACHE
+# SCHEMA
 # =========================================================
-
-SCHEMA_CACHE = {}
-
 
 def get_schema(file_path):
 
@@ -280,7 +302,7 @@ def get_schema(file_path):
 
 
 # =========================================================
-# DROP CHECK
+# COLUMN FILTER
 # =========================================================
 
 def should_drop_column(column_name):
@@ -295,10 +317,6 @@ def should_drop_column(column_name):
 
     return False
 
-
-# =========================================================
-# FILTER COLUMNS
-# =========================================================
 
 def get_filtered_columns(
     file_path,
@@ -399,6 +417,7 @@ def create_distinct_ids():
     COPY (
         SELECT DISTINCT {JOIN_COLUMN}
         FROM (
+
             SELECT {JOIN_COLUMN}
             FROM read_parquet(
                 '{RAW_A}/*.parquet'
@@ -410,6 +429,7 @@ def create_distinct_ids():
             FROM read_parquet(
                 '{RAW_B}/*.parquet'
             )
+
         )
         WHERE {JOIN_COLUMN} IS NOT NULL
     )
@@ -422,6 +442,8 @@ def create_distinct_ids():
     """
 
     con.execute(query)
+
+    force_cleanup()
 
     log("Distinct IDs Completed")
 
@@ -469,6 +491,8 @@ def create_id_map():
     """
 
     con.execute(query)
+
+    force_cleanup()
 
     log("ID Map Completed")
 
@@ -552,6 +576,8 @@ def process_file(
         query
     )
 
+    force_cleanup()
+
     log(
         f"Completed : {filename} "
         f"({time.time() - start:.2f} sec)"
@@ -599,7 +625,8 @@ def process_folder(
             completed += 1
 
             if completed % GC_INTERVAL == 0:
-                gc.collect()
+
+                force_cleanup()
 
             log(
                 f"Progress : "
@@ -610,6 +637,8 @@ def process_folder(
         files,
         futures
     )
+
+    force_cleanup()
 
 
 # =========================================================
@@ -631,26 +660,33 @@ def join_bucket(bucket):
         log(f"Skipping Joined Bucket : {bucket}")
         return
 
-    path_a = (
-        f"{PROCESSED_A}/bucket={bucket}"
-    )
+    files_a = []
 
-    path_b = (
-        f"{PROCESSED_B}/bucket={bucket}"
-    )
+    for root, _, files in os.walk(PROCESSED_A):
 
-    if not os.path.exists(path_a):
+        if f"bucket={bucket}" in root:
 
-        log(f"Missing A bucket : {bucket}")
-        return
+            for file in files:
 
-    if not os.path.exists(path_b):
+                if file.endswith(".parquet"):
 
-        log(f"Missing B bucket : {bucket}")
-        return
+                    files_a.append(
+                        os.path.join(root, file)
+                    )
 
-    files_a = parquet_files(path_a)
-    files_b = parquet_files(path_b)
+    files_b = []
+
+    for root, _, files in os.walk(PROCESSED_B):
+
+        if f"bucket={bucket}" in root:
+
+            for file in files:
+
+                if file.endswith(".parquet"):
+
+                    files_b.append(
+                        os.path.join(root, file)
+                    )
 
     if not files_a:
 
@@ -664,8 +700,8 @@ def join_bucket(bucket):
 
     log(
         f"Joining Bucket {bucket} "
-        f"A Files={len(files_a)} "
-        f"B Files={len(files_b)}"
+        f"A={len(files_a)} "
+        f"B={len(files_b)}"
     )
 
     left_columns = get_filtered_columns(
@@ -702,13 +738,9 @@ def join_bucket(bucket):
 
             {right_select}
 
-        FROM read_parquet(
-            '{path_a}/**/*.parquet'
-        ) a
+        FROM read_parquet($files_a) a
 
-        {JOIN_TYPE} JOIN read_parquet(
-            '{path_b}/**/*.parquet'
-        ) b
+        {JOIN_TYPE} JOIN read_parquet($files_b) b
 
         ON a.join_id = b.join_id
     )
@@ -720,13 +752,35 @@ def join_bucket(bucket):
     )
     """
 
-    con.execute(query)
+    con.execute(
+        query,
+        {
+            "files_a": files_a,
+            "files_b": files_b
+        }
+    )
 
     if CLEAN_AFTER_JOIN:
 
-        safe_remove(path_a)
+        for root, dirs, _ in os.walk(PROCESSED_A):
 
-        safe_remove(path_b)
+            for d in dirs:
+
+                if d == f"bucket={bucket}":
+
+                    safe_remove(
+                        os.path.join(root, d)
+                    )
+
+        for root, dirs, _ in os.walk(PROCESSED_B):
+
+            for d in dirs:
+
+                if d == f"bucket={bucket}":
+
+                    safe_remove(
+                        os.path.join(root, d)
+                    )
 
     clean_memory(
         left_columns,
@@ -737,6 +791,8 @@ def join_bucket(bucket):
         files_a,
         files_b
     )
+
+    force_cleanup()
 
     log(
         f"Bucket {bucket} Done "
@@ -754,26 +810,24 @@ def join_all_buckets():
     log("STEP 6 -> JOIN BUCKETS")
     log("=" * 80)
 
-    valid_buckets = []
+    valid_buckets = set()
 
-    for bucket in range(BUCKETS):
+    for root, dirs, _ in os.walk(PROCESSED_A):
 
-        path_a = (
-            f"{PROCESSED_A}/bucket={bucket}"
-        )
+        for d in dirs:
 
-        path_b = (
-            f"{PROCESSED_B}/bucket={bucket}"
-        )
+            if d.startswith("bucket="):
 
-        if (
-            os.path.exists(path_a)
-            and os.path.exists(path_b)
-        ):
-            valid_buckets.append(bucket)
+                bucket = int(
+                    d.replace("bucket=", "")
+                )
+
+                valid_buckets.add(bucket)
+
+    valid_buckets = sorted(valid_buckets)
 
     log(
-        f"Valid Buckets : "
+        f"Valid Buckets Found : "
         f"{len(valid_buckets)}"
     )
 
@@ -803,7 +857,8 @@ def join_all_buckets():
             completed += 1
 
             if completed % GC_INTERVAL == 0:
-                gc.collect()
+
+                force_cleanup()
 
             log(
                 f"Join Progress : "
@@ -815,6 +870,8 @@ def join_all_buckets():
         valid_buckets,
         futures
     )
+
+    force_cleanup()
 
 
 # =========================================================
@@ -870,6 +927,13 @@ def merge_outputs():
 
     con.execute(query)
 
+    clean_memory(
+        bucket_files,
+        query
+    )
+
+    force_cleanup()
+
     if CLEAN_AFTER_MERGE:
 
         for file in os.listdir(JOINED_DIR):
@@ -890,7 +954,7 @@ def merge_outputs():
 
 
 # =========================================================
-# CLEANUP
+# FINAL CLEANUP
 # =========================================================
 
 def cleanup():
@@ -913,9 +977,7 @@ def cleanup():
 
         log(str(e))
 
-    close_thread_connection()
-
-    SCHEMA_CACHE.clear()
+    force_cleanup()
 
     gc.collect()
 
