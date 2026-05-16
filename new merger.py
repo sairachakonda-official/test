@@ -177,11 +177,19 @@ def close_thread_connection():
 
 def parquet_files(folder):
 
-    return sorted(
-        os.path.join(folder, file)
-        for file in os.listdir(folder)
-        if file.endswith(".parquet")
-    )
+    parquet_list = []
+
+    for root, _, files in os.walk(folder):
+
+        for file in files:
+
+            if file.endswith(".parquet"):
+
+                parquet_list.append(
+                    os.path.join(root, file)
+                )
+
+    return sorted(parquet_list)
 
 
 def parquet_exists(path):
@@ -445,7 +453,7 @@ def create_id_map():
 
             {JOIN_COLUMN},
 
-            abs(hash({JOIN_COLUMN}))
+            row_number() OVER ()
             ::BIGINT AS join_id
 
         FROM read_parquet(
@@ -514,8 +522,7 @@ def process_file(
 
             m.join_id,
 
-            abs(hash(m.join_id))
-            % {BUCKETS} AS bucket
+            m.join_id % {BUCKETS} AS bucket
 
         FROM read_parquet('{file_path}') t
 
@@ -524,6 +531,8 @@ def process_file(
         ) m
 
         USING({JOIN_COLUMN})
+
+        WHERE m.join_id IS NOT NULL
     )
     TO '{output_path}'
     (
@@ -564,6 +573,8 @@ def process_folder(
     log("=" * 80)
 
     files = parquet_files(input_folder)
+
+    log(f"Total Files : {len(files)}")
 
     with ThreadPoolExecutor(
         max_workers=MAX_PROCESS_WORKERS
@@ -617,6 +628,7 @@ def join_bucket(bucket):
         SKIP_EXISTING
         and file_exists(output)
     ):
+        log(f"Skipping Joined Bucket : {bucket}")
         return
 
     path_a = (
@@ -628,16 +640,33 @@ def join_bucket(bucket):
     )
 
     if not os.path.exists(path_a):
+
+        log(f"Missing A bucket : {bucket}")
         return
 
     if not os.path.exists(path_b):
+
+        log(f"Missing B bucket : {bucket}")
         return
 
     files_a = parquet_files(path_a)
     files_b = parquet_files(path_b)
 
-    if not files_a or not files_b:
+    if not files_a:
+
+        log(f"No parquet files in A : {bucket}")
         return
+
+    if not files_b:
+
+        log(f"No parquet files in B : {bucket}")
+        return
+
+    log(
+        f"Joining Bucket {bucket} "
+        f"A Files={len(files_a)} "
+        f"B Files={len(files_b)}"
+    )
 
     left_columns = get_filtered_columns(
         files_a[0],
@@ -674,11 +703,11 @@ def join_bucket(bucket):
             {right_select}
 
         FROM read_parquet(
-            '{path_a}/*.parquet'
+            '{path_a}/**/*.parquet'
         ) a
 
         {JOIN_TYPE} JOIN read_parquet(
-            '{path_b}/*.parquet'
+            '{path_b}/**/*.parquet'
         ) b
 
         ON a.join_id = b.join_id
@@ -743,6 +772,16 @@ def join_all_buckets():
         ):
             valid_buckets.append(bucket)
 
+    log(
+        f"Valid Buckets : "
+        f"{len(valid_buckets)}"
+    )
+
+    if not valid_buckets:
+
+        log("NO VALID BUCKETS FOUND")
+        return
+
     with ThreadPoolExecutor(
         max_workers=MAX_JOIN_WORKERS
     ) as executor:
@@ -791,6 +830,19 @@ def merge_outputs():
     output = (
         f"{JOINED_DIR}/final_output.parquet"
     )
+
+    bucket_files = parquet_files(JOINED_DIR)
+
+    bucket_files = [
+        file
+        for file in bucket_files
+        if os.path.basename(file).startswith("bucket_")
+    ]
+
+    if not bucket_files:
+
+        log("NO BUCKET FILES FOUND")
+        return
 
     if (
         SKIP_EXISTING
