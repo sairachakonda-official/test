@@ -1,54 +1,121 @@
-import os
-import gc
-import uuid
-import shutil
-import duckdb
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import os,gc,time,duckdb,psutil
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor,as_completed
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-INPUT_FOLDER = "input_parquet"
-OUTPUT_FOLDER = "partitioned_output"
+INPUT_FOLDER="input_parquet"
+ID_MAP_FILE="id_map/id_map.parquet"
+OUTPUT_FOLDER="partitioned_output"
 
-BUCKET_COLUMN = "bucket"
+JOIN_KEY="client_data1"
+BUCKET_COLUMN="bucket_number"
 
-# Faster compression for max speed
-COMPRESSION = "SNAPPY"
+# KEEP join_id INSIDE FINAL PARQUET
+JOIN_ID_COLUMN="join_id"
 
-# Parallel workers
-MAX_WORKERS = min(4, os.cpu_count())
+DROP_COLUMNS={
+    "unnecessary_col1",
+    "unnecessary_col2"
+}
 
-# DuckDB threads per worker
-DUCKDB_THREADS_PER_WORKER = max(
-    1,
-    os.cpu_count() // MAX_WORKERS
-)
+DROP_PREFIXES={
+    "tmp_",
+    "debug_",
+    "unused_"
+}
 
-# Column pruning
-SELECT_COLUMNS = "*"
+COMPRESSION="SNAPPY"
 
-# Bigger row groups = faster writes
-ROW_GROUP_SIZE = 5_000_000
+# =============================================================================
+# SYSTEM
+# =============================================================================
 
-# Temp working directory
-TEMP_BASE = "tmp_partition"
+AVAILABLE_RAM_GB=psutil.virtual_memory().available/(1024**3)
+
+if AVAILABLE_RAM_GB>=64:
+    MAX_WORKERS=4
+elif AVAILABLE_RAM_GB>=32:
+    MAX_WORKERS=3
+elif AVAILABLE_RAM_GB>=16:
+    MAX_WORKERS=2
+else:
+    MAX_WORKERS=1
+
+# multiprocessing enabled
+DUCKDB_THREADS=1
+
+SETTINGS_PROFILES=[
+    {
+        "name":"FAST",
+        "threads":1,
+        "row_group_size":1000000,
+        "memory_limit":"4GB"
+    },
+    {
+        "name":"SAFE",
+        "threads":1,
+        "row_group_size":250000,
+        "memory_limit":"2GB"
+    },
+    {
+        "name":"ULTRA_SAFE",
+        "threads":1,
+        "row_group_size":100000,
+        "memory_limit":"1GB"
+    }
+]
+
+LOG_FOLDER="logs"
 
 # =============================================================================
 # SETUP
 # =============================================================================
 
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-os.makedirs(TEMP_BASE, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER,exist_ok=True)
+os.makedirs(LOG_FOLDER,exist_ok=True)
+
+LOG_FILE=os.path.join(
+    LOG_FOLDER,
+    f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+)
 
 # =============================================================================
 # LOG
 # =============================================================================
 
 def log(msg):
-    print(msg, flush=True)
+
+    timestamp=datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    final_msg=f"[{timestamp}] {msg}"
+
+    print(final_msg,flush=True)
+
+    with open(LOG_FILE,"a",encoding="utf-8") as f:
+        f.write(final_msg+"\n")
+
+# =============================================================================
+# MEMORY
+# =============================================================================
+
+def print_memory():
+
+    mem=psutil.virtual_memory()
+
+    used=mem.used/(1024**3)
+    avail=mem.available/(1024**3)
+    total=mem.total/(1024**3)
+
+    log(
+        f"RAM Used={used:.2f}GB "
+        f"Avail={avail:.2f}GB "
+        f"Total={total:.2f}GB"
+    )
 
 # =============================================================================
 # CLEANUP
@@ -59,27 +126,27 @@ def cleanup(con=None):
     try:
         if con:
             con.close()
-    except:
-        pass
+    except Exception as e:
+        log(f"Cleanup failed={str(e)}")
 
     gc.collect()
 
 # =============================================================================
-# GET PARQUET FILES
+# FILE DISCOVERY
 # =============================================================================
 
 def get_parquet_files(folder):
 
-    parquet_files = []
+    parquet_files=[]
 
-    for root, _, files in os.walk(folder):
+    for root,_,files in os.walk(folder):
 
         for file in files:
 
             if file.endswith(".parquet"):
 
                 parquet_files.append(
-                    os.path.join(root, file)
+                    os.path.join(root,file)
                 )
 
     parquet_files.sort()
@@ -87,156 +154,283 @@ def get_parquet_files(folder):
     return parquet_files
 
 # =============================================================================
-# MOVE GENERATED FILES
-# =============================================================================
-
-def move_partition_files(temp_output_dir):
-
-    if not os.path.exists(temp_output_dir):
-        return
-
-    # -------------------------------------------------------------------------
-    # LOOP BUCKET FOLDERS
-    # -------------------------------------------------------------------------
-
-    for bucket_name in os.listdir(temp_output_dir):
-
-        bucket_dir = os.path.join(
-            temp_output_dir,
-            bucket_name
-        )
-
-        if not os.path.isdir(bucket_dir):
-            continue
-
-        final_bucket_dir = os.path.join(
-            OUTPUT_FOLDER,
-            bucket_name
-        )
-
-        os.makedirs(
-            final_bucket_dir,
-            exist_ok=True
-        )
-
-        # ---------------------------------------------------------------------
-        # MOVE PARQUET FILES
-        # ---------------------------------------------------------------------
-
-        for file in os.listdir(bucket_dir):
-
-            if not file.endswith(".parquet"):
-                continue
-
-            src_file = os.path.join(
-                bucket_dir,
-                file
-            )
-
-            unique_name = (
-                f"part_{uuid.uuid4().hex}.parquet"
-            )
-
-            dst_file = os.path.join(
-                final_bucket_dir,
-                unique_name
-            )
-
-            shutil.move(
-                src_file,
-                dst_file
-            )
-
-# =============================================================================
 # PROCESS FILE
 # =============================================================================
 
-def process_file(file_path):
+def process_file(file_path,idx,total_files):
 
-    file_name = os.path.basename(file_path)
+    file_name=os.path.basename(file_path)
 
-    worker_temp_dir = os.path.join(
-        TEMP_BASE,
-        uuid.uuid4().hex
-    )
+    log("="*80)
+    log(f"[{idx}/{total_files}] {file_name}")
+    log("="*80)
 
-    os.makedirs(
-        worker_temp_dir,
-        exist_ok=True
-    )
+    file_start=time.time()
 
-    con = duckdb.connect()
+    print_memory()
 
     try:
 
-        log("=" * 80)
-        log(f"Processing: {file_name}")
-        log("=" * 80)
+        file_size_gb=os.path.getsize(file_path)/(1024**3)
+
+        log(f"Input Size={file_size_gb:.2f}GB")
+
+    except:
+        pass
+
+    con=duckdb.connect()
+
+    try:
 
         # ---------------------------------------------------------------------
-        # PERFORMANCE SETTINGS
+        # GLOBAL SETTINGS
         # ---------------------------------------------------------------------
-
-        con.execute(
-            f"PRAGMA threads={DUCKDB_THREADS_PER_WORKER}"
-        )
 
         con.execute(
             "PRAGMA preserve_insertion_order=false"
         )
 
         con.execute(
-            f"PRAGMA temp_directory='{worker_temp_dir}'"
+            "PRAGMA parquet_metadata_cache=true"
         )
 
         # ---------------------------------------------------------------------
-        # SINGLE PASS PARTITION WRITE
+        # LOAD ID MAP ONCE
         # ---------------------------------------------------------------------
 
-        query = f"""
-        COPY (
-            SELECT {SELECT_COLUMNS}
-            FROM read_parquet('{file_path}')
-            WHERE {BUCKET_COLUMN} IS NOT NULL
-        )
-        TO '{worker_temp_dir}'
-        (
-            FORMAT PARQUET,
-            PARTITION_BY ({BUCKET_COLUMN}),
-            PER_THREAD_OUTPUT TRUE,
-            ROW_GROUP_SIZE {ROW_GROUP_SIZE},
-            COMPRESSION {COMPRESSION}
-        )
+        log("Loading ID map")
+
+        con.execute(f"""
+        CREATE TEMP TABLE id_map AS
+        SELECT
+            {JOIN_KEY},
+            {JOIN_ID_COLUMN},
+            {BUCKET_COLUMN}
+        FROM read_parquet('{ID_MAP_FILE}')
+        """)
+
+        # ---------------------------------------------------------------------
+        # ROW COUNT
+        # ---------------------------------------------------------------------
+
+        total_rows=con.execute(f"""
+        SELECT COUNT(*)
+        FROM read_parquet('{file_path}')
+        """).fetchone()[0]
+
+        log(f"Rows={total_rows:,}")
+
+        # ---------------------------------------------------------------------
+        # READ SCHEMA
+        # ---------------------------------------------------------------------
+
+        schema_query=f"""
+        SELECT *
+        FROM read_parquet('{file_path}')
+        LIMIT 0
         """
 
-        con.execute(query)
+        source_columns=[
+            desc[0]
+            for desc in con.execute(
+                schema_query
+            ).description
+        ]
+
+        log(
+            f"Source Columns="
+            f"{len(source_columns)}"
+        )
 
         # ---------------------------------------------------------------------
-        # MOVE GENERATED FILES
+        # FILTER COLUMNS
         # ---------------------------------------------------------------------
 
-        move_partition_files(worker_temp_dir)
+        filtered_columns=[]
 
-        log(f"Completed: {file_name}")
+        for col in source_columns:
 
-        return f"SUCCESS: {file_name}"
+            if col in DROP_COLUMNS:
+                continue
+
+            skip=False
+
+            for prefix in DROP_PREFIXES:
+
+                if col.startswith(prefix):
+                    skip=True
+                    break
+
+            if skip:
+                continue
+
+            filtered_columns.append(
+                f"src.{col}"
+            )
+
+        log(
+            f"Filtered Columns="
+            f"{len(filtered_columns)}"
+        )
+
+        select_sql=",\n".join(filtered_columns)
+
+        # ---------------------------------------------------------------------
+        # JOIN + PARTITION
+        # ---------------------------------------------------------------------
+
+        success=False
+        last_error=None
+
+        for profile in SETTINGS_PROFILES:
+
+            try:
+
+                log("-"*80)
+
+                log(
+                    f"PROFILE={profile['name']} "
+                    f"THREADS={profile['threads']} "
+                    f"MEMORY={profile['memory_limit']} "
+                    f"ROW_GROUP={profile['row_group_size']}"
+                )
+
+                con.execute(
+                    f"""
+                    PRAGMA threads=
+                    {profile['threads']}
+                    """
+                )
+
+                con.execute(
+                    f"""
+                    PRAGMA memory_limit=
+                    '{profile["memory_limit"]}'
+                    """
+                )
+
+                partition_start=time.time()
+
+                query=f"""
+                COPY (
+                    SELECT
+
+                        {select_sql},
+
+                        map.{JOIN_ID_COLUMN},
+
+                        map.{BUCKET_COLUMN},
+
+                        map.{BUCKET_COLUMN}
+                        AS bucket_number_file
+
+                    FROM read_parquet('{file_path}') src
+
+                    INNER JOIN id_map map
+
+                    ON src.{JOIN_KEY}=map.{JOIN_KEY}
+                )
+                TO '{OUTPUT_FOLDER}'
+                (
+                    FORMAT PARQUET,
+
+                    PARTITION_BY ({BUCKET_COLUMN}),
+
+                    OVERWRITE_OR_IGNORE FALSE,
+
+                    PER_THREAD_OUTPUT FALSE,
+
+                    ROW_GROUP_SIZE
+                    {profile["row_group_size"]},
+
+                    COMPRESSION {COMPRESSION}
+                )
+                """
+
+                con.execute(query)
+
+                elapsed=time.time()-partition_start
+
+                log(
+                    f"{profile['name']} SUCCESS "
+                    f"{elapsed:.2f} sec"
+                )
+
+                success=True
+
+                break
+
+            except Exception as e:
+
+                last_error=str(e)
+
+                log(
+                    f"{profile['name']} FAILED"
+                )
+
+                log(last_error)
+
+                error_lower=last_error.lower()
+
+                memory_keywords=[
+                    "memory",
+                    "oom",
+                    "out of memory",
+                    "allocation",
+                ]
+
+                is_memory_error=any(
+                    x in error_lower
+                    for x in memory_keywords
+                )
+
+                if is_memory_error:
+
+                    log(
+                        "Memory issue -> "
+                        "fallback profile"
+                    )
+
+                    gc.collect()
+
+                else:
+
+                    raise
+
+        if not success:
+
+            raise Exception(
+                f"All profiles failed: "
+                f"{last_error}"
+            )
+
+        total_elapsed=time.time()-file_start
+
+        print_memory()
+
+        log(
+            f"Completed {file_name} "
+            f"in {total_elapsed:.2f} sec"
+        )
 
     except Exception as e:
 
-        return f"ERROR: {file_name} -> {str(e)}"
+        log(
+            f"ERROR PROCESSING "
+            f"{file_name}"
+        )
+
+        log(str(e))
 
     finally:
 
         cleanup(con)
 
-        # ---------------------------------------------------------------------
-        # REMOVE TEMP DIR
-        # ---------------------------------------------------------------------
+        print_memory()
 
-        try:
-            shutil.rmtree(worker_temp_dir)
-        except:
-            pass
+        log("="*80)
+        log(f"END FILE {file_name}")
+        log("="*80)
 
 # =============================================================================
 # MAIN
@@ -244,52 +438,81 @@ def process_file(file_path):
 
 def main():
 
-    log("=" * 80)
-    log("MAXIMUM SPEED PARQUET PARTITION PIPELINE")
-    log("=" * 80)
+    total_start=time.time()
 
-    files = get_parquet_files(INPUT_FOLDER)
+    log("="*80)
+    log("PARALLEL JOIN + PARTITION PIPELINE")
+    log("="*80)
 
-    total_files = len(files)
+    log(f"Workers={MAX_WORKERS}")
+    log(f"DuckDB Threads={DUCKDB_THREADS}")
 
-    log(f"Files Found           : {total_files}")
-    log(f"Parallel Workers      : {MAX_WORKERS}")
-    log(f"DuckDB Threads/Worker : {DUCKDB_THREADS_PER_WORKER}")
-    log(f"Compression           : {COMPRESSION}")
+    print_memory()
 
-    if total_files == 0:
+    if not os.path.exists(ID_MAP_FILE):
 
-        log("No parquet files found")
+        log(f"ID Map missing={ID_MAP_FILE}")
+
         return
 
-    # -------------------------------------------------------------------------
-    # PARALLEL FILE PROCESSING
-    # -------------------------------------------------------------------------
+    files=get_parquet_files(INPUT_FOLDER)
+
+    total_files=len(files)
+
+    log(f"Files Found={total_files}")
+
+    if total_files==0:
+        return
 
     with ProcessPoolExecutor(
         max_workers=MAX_WORKERS
     ) as executor:
 
-        futures = [
-            executor.submit(
-                process_file,
-                file_path
+        futures=[]
+
+        for idx,file_path in enumerate(files,1):
+
+            futures.append(
+
+                executor.submit(
+                    process_file,
+                    file_path,
+                    idx,
+                    total_files
+                )
             )
-            for file_path in files
-        ]
 
         for future in as_completed(futures):
 
-            result = future.result()
+            try:
 
-            log(result)
+                future.result()
 
-    log("\nALL DONE")
+            except Exception as e:
+
+                log(
+                    f"Parallel worker failed="
+                    f"{str(e)}"
+                )
+
+    total_elapsed=time.time()-total_start
+
+    log("="*80)
+    log("ALL FILES COMPLETED")
+    log("="*80)
+
+    log(
+        f"Total Pipeline Time="
+        f"{total_elapsed:.2f} sec"
+    )
+
+    print_memory()
+
+    log(f"Log File={LOG_FILE}")
 
 # =============================================================================
 # ENTRY
 # =============================================================================
 
-if __name__ == "__main__":
-
+if __name__=="__main__":
     main()
