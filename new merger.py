@@ -1,6 +1,8 @@
+```python
 import gc
 import os
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -64,7 +66,6 @@ CLEAN_AFTER_MERGE = False
 
 # =========================================================
 # KEEP COLUMNS
-# None = keep all
 # =========================================================
 
 PROCESS_COLUMNS_A = None
@@ -77,10 +78,7 @@ RIGHT_COLUMNS = None
 
 
 # =========================================================
-# SINGLE DROP CONFIG
-# SUPPORTS:
-# - EXACT MATCH
-# - PREFIX MATCH
+# DROP CONFIG
 # =========================================================
 
 DROP_COLUMNS = [
@@ -111,14 +109,19 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 # =========================================================
-# HELPERS
+# LOGGER
 # =========================================================
 
 def log(message):
     print(f"[{time.strftime('%H:%M:%S')}] {message}")
 
 
+# =========================================================
+# FILE HELPERS
+# =========================================================
+
 def parquet_exists(path):
+
     if not os.path.exists(path):
         return False
 
@@ -133,6 +136,7 @@ def parquet_exists(path):
 
 
 def parquet_files(folder):
+
     return sorted(
         os.path.join(folder, file)
         for file in os.listdir(folder)
@@ -141,6 +145,7 @@ def parquet_files(folder):
 
 
 def file_exists(path):
+
     return (
         os.path.exists(path)
         and os.path.getsize(path) > 0
@@ -148,6 +153,7 @@ def file_exists(path):
 
 
 def safe_remove(path):
+
     try:
 
         if os.path.isfile(path):
@@ -163,11 +169,95 @@ def safe_remove(path):
         log(str(e))
 
 
-def clean_memory():
+# =========================================================
+# MEMORY CLEANER
+# =========================================================
+
+def flush_duckdb(con=None):
+
+    try:
+
+        if con is not None:
+
+            try:
+                con.execute("CHECKPOINT")
+            except:
+                pass
+
+            try:
+                con.close()
+            except:
+                pass
+
+    except:
+        pass
+
+
+def cleanup_temp_files():
+
+    try:
+
+        if os.path.exists(TEMP_DIR):
+
+            for item in os.listdir(TEMP_DIR):
+
+                safe_remove(
+                    os.path.join(TEMP_DIR, item)
+                )
+
+    except Exception as e:
+
+        log(f"Temp Cleanup Failed : {e}")
+
+
+def clear_threads():
+
+    gc.collect()
+
+    for thread in threading.enumerate():
+
+        if thread.daemon:
+            continue
+
     gc.collect()
 
 
+def clean_memory(*variables):
+
+    try:
+
+        for var in variables:
+
+            try:
+                del var
+            except:
+                pass
+
+        gc.collect()
+
+    except:
+        pass
+
+
+def full_cleanup(con=None, *variables):
+
+    flush_duckdb(con)
+
+    cleanup_temp_files()
+
+    clear_threads()
+
+    clean_memory(*variables)
+
+    gc.collect()
+
+
+# =========================================================
+# DUCKDB CONNECT
+# =========================================================
+
 def connect():
+
     con = duckdb.connect()
 
     con.execute(
@@ -194,19 +284,15 @@ def connect():
 
 
 # =========================================================
-# COLUMN DROP CHECKER
+# DROP CHECKER
 # =========================================================
 
 def should_drop_column(column_name):
 
     for value in DROP_COLUMNS:
 
-        # EXACT MATCH
-
         if column_name == value:
             return True
-
-        # PREFIX MATCH
 
         if column_name.startswith(value):
             return True
@@ -215,13 +301,14 @@ def should_drop_column(column_name):
 
 
 # =========================================================
-# FILTER SOURCE COLUMNS
+# FILTER COLUMNS
 # =========================================================
 
 def get_filtered_columns(
     file_path,
     keep_columns=None
 ):
+
     con = connect()
 
     schema = con.execute(
@@ -231,8 +318,6 @@ def get_filtered_columns(
         FROM read_parquet('{file_path}')
         """
     ).fetchall()
-
-    con.close()
 
     all_columns = [row[0] for row in schema]
 
@@ -258,6 +343,12 @@ def get_filtered_columns(
     if JOIN_COLUMN not in filtered:
         filtered.insert(0, JOIN_COLUMN)
 
+    full_cleanup(
+        con,
+        schema,
+        all_columns
+    )
+
     return filtered
 
 
@@ -270,6 +361,7 @@ def build_join_select(
     alias,
     prefix=None
 ):
+
     cleaned = []
 
     seen = set()
@@ -297,7 +389,14 @@ def build_join_select(
                 f"AS {mapped_name}"
             )
 
-    return ",\n".join(cleaned)
+    result = ",\n".join(cleaned)
+
+    clean_memory(
+        cleaned,
+        seen
+    )
+
+    return result
 
 
 # =========================================================
@@ -305,6 +404,7 @@ def build_join_select(
 # =========================================================
 
 def create_distinct_ids():
+
     log("=" * 80)
 
     log("STEP 1 -> CREATE DISTINCT IDS")
@@ -320,7 +420,6 @@ def create_distinct_ids():
         and file_exists(output)
     ):
         log("Distinct IDs Exist -> Skipping")
-
         return
 
     con = connect()
@@ -346,17 +445,17 @@ def create_distinct_ids():
     TO '{output}'
     (
         FORMAT PARQUET,
-        COMPRESSION
-        '{COMPRESSION_INTERMEDIATE}',
+        COMPRESSION '{COMPRESSION_INTERMEDIATE}',
         ROW_GROUP_SIZE {ROW_GROUP_SIZE}
     )
     """
 
     con.execute(query)
 
-    con.close()
-
-    clean_memory()
+    full_cleanup(
+        con,
+        query
+    )
 
     log("Distinct IDs Completed")
 
@@ -366,6 +465,7 @@ def create_distinct_ids():
 # =========================================================
 
 def create_id_map():
+
     log("=" * 80)
 
     log("STEP 2 -> CREATE ID MAP")
@@ -379,7 +479,6 @@ def create_id_map():
         and file_exists(output)
     ):
         log("ID Map Exists -> Skipping")
-
         return
 
     con = connect()
@@ -400,17 +499,17 @@ def create_id_map():
     TO '{output}'
     (
         FORMAT PARQUET,
-        COMPRESSION
-        '{COMPRESSION_INTERMEDIATE}',
+        COMPRESSION '{COMPRESSION_INTERMEDIATE}',
         ROW_GROUP_SIZE {ROW_GROUP_SIZE}
     )
     """
 
     con.execute(query)
 
-    con.close()
-
-    clean_memory()
+    full_cleanup(
+        con,
+        query
+    )
 
     log("ID Map Completed")
 
@@ -424,6 +523,7 @@ def process_file(
     output_dir,
     keep_columns=None
 ):
+
     start = time.time()
 
     filename = os.path.splitext(
@@ -439,7 +539,6 @@ def process_file(
         and parquet_exists(output_path)
     ):
         log(f"Skipping : {filename}")
-
         return
 
     log(f"Processing : {filename}")
@@ -483,8 +582,7 @@ def process_file(
     (
         FORMAT PARQUET,
         PARTITION_BY(bucket),
-        COMPRESSION
-        '{COMPRESSION_INTERMEDIATE}',
+        COMPRESSION '{COMPRESSION_INTERMEDIATE}',
         ROW_GROUP_SIZE {ROW_GROUP_SIZE},
         OVERWRITE_OR_IGNORE
     )
@@ -492,9 +590,12 @@ def process_file(
 
     con.execute(query)
 
-    con.close()
-
-    clean_memory()
+    full_cleanup(
+        con,
+        selected_columns,
+        select_sql,
+        query
+    )
 
     log(
         f"Completed : {filename} "
@@ -511,6 +612,7 @@ def process_folder(
     output_folder,
     keep_columns=None
 ):
+
     log("=" * 80)
 
     log(f"PROCESSING : {input_folder}")
@@ -546,12 +648,19 @@ def process_folder(
                 f"{completed}/{len(files)}"
             )
 
+    full_cleanup(
+        None,
+        files,
+        futures
+    )
+
 
 # =========================================================
 # STEP 5 -> JOIN BUCKET
 # =========================================================
 
 def join_bucket(bucket):
+
     start = time.time()
 
     output = (
@@ -635,23 +744,27 @@ def join_bucket(bucket):
     TO '{output}'
     (
         FORMAT PARQUET,
-        COMPRESSION
-        '{COMPRESSION_INTERMEDIATE}',
+        COMPRESSION '{COMPRESSION_INTERMEDIATE}',
         ROW_GROUP_SIZE {ROW_GROUP_SIZE}
     )
     """
 
     con.execute(query)
 
-    con.close()
-
-    clean_memory()
-
     if CLEAN_AFTER_JOIN:
 
         safe_remove(path_a)
 
         safe_remove(path_b)
+
+    full_cleanup(
+        con,
+        left_columns,
+        right_columns,
+        left_select,
+        right_select,
+        query
+    )
 
     log(
         f"Bucket {bucket} Done "
@@ -664,6 +777,7 @@ def join_bucket(bucket):
 # =========================================================
 
 def join_all_buckets():
+
     log("=" * 80)
 
     log("STEP 6 -> JOIN ALL BUCKETS")
@@ -714,12 +828,19 @@ def join_all_buckets():
                 f"{len(valid_buckets)}"
             )
 
+    full_cleanup(
+        None,
+        valid_buckets,
+        futures
+    )
+
 
 # =========================================================
 # STEP 7 -> MERGE OUTPUTS
 # =========================================================
 
 def merge_outputs():
+
     log("=" * 80)
 
     log("STEP 7 -> MERGE OUTPUTS")
@@ -735,7 +856,6 @@ def merge_outputs():
         and file_exists(output)
     ):
         log("Final Output Exists")
-
         return
 
     con = connect()
@@ -750,17 +870,12 @@ def merge_outputs():
     TO '{output}'
     (
         FORMAT PARQUET,
-        COMPRESSION
-        '{COMPRESSION_FINAL}',
+        COMPRESSION '{COMPRESSION_FINAL}',
         ROW_GROUP_SIZE {ROW_GROUP_SIZE}
     )
     """
 
     con.execute(query)
-
-    con.close()
-
-    clean_memory()
 
     if CLEAN_AFTER_MERGE:
 
@@ -770,6 +885,7 @@ def merge_outputs():
                 file.startswith("bucket_")
                 and file.endswith(".parquet")
             ):
+
                 safe_remove(
                     os.path.join(
                         JOINED_DIR,
@@ -777,19 +893,39 @@ def merge_outputs():
                     )
                 )
 
+    full_cleanup(
+        con,
+        query
+    )
+
     log("Final Merge Completed")
 
 
 # =========================================================
-# STEP 8 -> CLEAN TEMP
+# STEP 8 -> CLEANUP
 # =========================================================
 
 def cleanup_temp():
+
     safe_remove(TEMP_DIR)
 
     os.makedirs(TEMP_DIR, exist_ok=True)
 
-    clean_memory()
+    for folder in [
+        MAPPING_DIR,
+        PROCESSED_A,
+        PROCESSED_B
+    ]:
+
+        wal_file = f"{folder}.wal"
+
+        if os.path.exists(wal_file):
+
+            safe_remove(wal_file)
+
+    gc.collect()
+
+    clear_threads()
 
     log("Temp Cleaned")
 
@@ -799,6 +935,7 @@ def cleanup_temp():
 # =========================================================
 
 def main():
+
     total_start = time.time()
 
     log("=" * 80)
@@ -842,4 +979,6 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
+```
