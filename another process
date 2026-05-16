@@ -1,0 +1,295 @@
+import os
+import gc
+import uuid
+import shutil
+import duckdb
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+INPUT_FOLDER = "input_parquet"
+OUTPUT_FOLDER = "partitioned_output"
+
+BUCKET_COLUMN = "bucket"
+
+# Faster compression for max speed
+COMPRESSION = "SNAPPY"
+
+# Parallel workers
+MAX_WORKERS = min(4, os.cpu_count())
+
+# DuckDB threads per worker
+DUCKDB_THREADS_PER_WORKER = max(
+    1,
+    os.cpu_count() // MAX_WORKERS
+)
+
+# Column pruning
+SELECT_COLUMNS = "*"
+
+# Bigger row groups = faster writes
+ROW_GROUP_SIZE = 5_000_000
+
+# Temp working directory
+TEMP_BASE = "tmp_partition"
+
+# =============================================================================
+# SETUP
+# =============================================================================
+
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(TEMP_BASE, exist_ok=True)
+
+# =============================================================================
+# LOG
+# =============================================================================
+
+def log(msg):
+    print(msg, flush=True)
+
+# =============================================================================
+# CLEANUP
+# =============================================================================
+
+def cleanup(con=None):
+
+    try:
+        if con:
+            con.close()
+    except:
+        pass
+
+    gc.collect()
+
+# =============================================================================
+# GET PARQUET FILES
+# =============================================================================
+
+def get_parquet_files(folder):
+
+    parquet_files = []
+
+    for root, _, files in os.walk(folder):
+
+        for file in files:
+
+            if file.endswith(".parquet"):
+
+                parquet_files.append(
+                    os.path.join(root, file)
+                )
+
+    parquet_files.sort()
+
+    return parquet_files
+
+# =============================================================================
+# MOVE GENERATED FILES
+# =============================================================================
+
+def move_partition_files(temp_output_dir):
+
+    if not os.path.exists(temp_output_dir):
+        return
+
+    # -------------------------------------------------------------------------
+    # LOOP BUCKET FOLDERS
+    # -------------------------------------------------------------------------
+
+    for bucket_name in os.listdir(temp_output_dir):
+
+        bucket_dir = os.path.join(
+            temp_output_dir,
+            bucket_name
+        )
+
+        if not os.path.isdir(bucket_dir):
+            continue
+
+        final_bucket_dir = os.path.join(
+            OUTPUT_FOLDER,
+            bucket_name
+        )
+
+        os.makedirs(
+            final_bucket_dir,
+            exist_ok=True
+        )
+
+        # ---------------------------------------------------------------------
+        # MOVE PARQUET FILES
+        # ---------------------------------------------------------------------
+
+        for file in os.listdir(bucket_dir):
+
+            if not file.endswith(".parquet"):
+                continue
+
+            src_file = os.path.join(
+                bucket_dir,
+                file
+            )
+
+            unique_name = (
+                f"part_{uuid.uuid4().hex}.parquet"
+            )
+
+            dst_file = os.path.join(
+                final_bucket_dir,
+                unique_name
+            )
+
+            shutil.move(
+                src_file,
+                dst_file
+            )
+
+# =============================================================================
+# PROCESS FILE
+# =============================================================================
+
+def process_file(file_path):
+
+    file_name = os.path.basename(file_path)
+
+    worker_temp_dir = os.path.join(
+        TEMP_BASE,
+        uuid.uuid4().hex
+    )
+
+    os.makedirs(
+        worker_temp_dir,
+        exist_ok=True
+    )
+
+    con = duckdb.connect()
+
+    try:
+
+        log("=" * 80)
+        log(f"Processing: {file_name}")
+        log("=" * 80)
+
+        # ---------------------------------------------------------------------
+        # PERFORMANCE SETTINGS
+        # ---------------------------------------------------------------------
+
+        con.execute(
+            f"PRAGMA threads={DUCKDB_THREADS_PER_WORKER}"
+        )
+
+        con.execute(
+            "PRAGMA preserve_insertion_order=false"
+        )
+
+        con.execute(
+            f"PRAGMA temp_directory='{worker_temp_dir}'"
+        )
+
+        # ---------------------------------------------------------------------
+        # SINGLE PASS PARTITION WRITE
+        # ---------------------------------------------------------------------
+
+        query = f"""
+        COPY (
+            SELECT {SELECT_COLUMNS}
+            FROM read_parquet('{file_path}')
+            WHERE {BUCKET_COLUMN} IS NOT NULL
+        )
+        TO '{worker_temp_dir}'
+        (
+            FORMAT PARQUET,
+            PARTITION_BY ({BUCKET_COLUMN}),
+            PER_THREAD_OUTPUT TRUE,
+            ROW_GROUP_SIZE {ROW_GROUP_SIZE},
+            COMPRESSION {COMPRESSION}
+        )
+        """
+
+        con.execute(query)
+
+        # ---------------------------------------------------------------------
+        # MOVE GENERATED FILES
+        # ---------------------------------------------------------------------
+
+        move_partition_files(worker_temp_dir)
+
+        log(f"Completed: {file_name}")
+
+        return f"SUCCESS: {file_name}"
+
+    except Exception as e:
+
+        return f"ERROR: {file_name} -> {str(e)}"
+
+    finally:
+
+        cleanup(con)
+
+        # ---------------------------------------------------------------------
+        # REMOVE TEMP DIR
+        # ---------------------------------------------------------------------
+
+        try:
+            shutil.rmtree(worker_temp_dir)
+        except:
+            pass
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+
+    log("=" * 80)
+    log("MAXIMUM SPEED PARQUET PARTITION PIPELINE")
+    log("=" * 80)
+
+    files = get_parquet_files(INPUT_FOLDER)
+
+    total_files = len(files)
+
+    log(f"Files Found           : {total_files}")
+    log(f"Parallel Workers      : {MAX_WORKERS}")
+    log(f"DuckDB Threads/Worker : {DUCKDB_THREADS_PER_WORKER}")
+    log(f"Compression           : {COMPRESSION}")
+
+    if total_files == 0:
+
+        log("No parquet files found")
+        return
+
+    # -------------------------------------------------------------------------
+    # PARALLEL FILE PROCESSING
+    # -------------------------------------------------------------------------
+
+    with ProcessPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                process_file,
+                file_path
+            )
+            for file_path in files
+        ]
+
+        for future in as_completed(futures):
+
+            result = future.result()
+
+            log(result)
+
+    log("\nALL DONE")
+
+# =============================================================================
+# ENTRY
+# =============================================================================
+
+if __name__ == "__main__":
+
+    main()
