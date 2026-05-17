@@ -1,0 +1,200 @@
+import os
+import gc
+import time
+import duckdb
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# =========================
+# CONFIG
+# =========================
+
+LEFT_ROOT  = "left_folder"
+RIGHT_ROOT = "right_folder"
+OUTPUT_ROOT = "merged_output"
+
+JOIN_KEY = "join_key"
+JOIN_TYPE = "inner"   # inner / left / right / full
+
+MAX_WORKERS = 4
+ROW_GROUP_SIZE = 500000
+
+# optional
+LEFT_DROP_COLS = []
+RIGHT_DROP_COLS = []
+
+# =========================
+# UTILS
+# =========================
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def get_bucket_paths(root):
+    buckets = {}
+
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+
+        if os.path.isdir(path) and name.startswith("bucket="):
+            bucket_id = name.split("=")[-1]
+            buckets[bucket_id] = path
+
+    return buckets
+
+def list_parquet_files(folder):
+    files = []
+
+    for root, _, names in os.walk(folder):
+        for n in names:
+            if n.endswith(".parquet"):
+                files.append(os.path.join(root, n))
+
+    return files
+
+# =========================
+# MERGE SINGLE BUCKET
+# =========================
+
+def merge_bucket(bucket_id, left_path, right_path):
+
+    start = time.time()
+
+    log(f"START bucket={bucket_id}")
+
+    out_dir = os.path.join(OUTPUT_ROOT, f"bucket={bucket_id}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    output_file = os.path.join(out_dir, "merged.parquet")
+
+    if os.path.exists(output_file):
+        log(f"SKIP bucket={bucket_id} already exists")
+        return
+
+    left_files = list_parquet_files(left_path)
+    right_files = list_parquet_files(right_path)
+
+    if not left_files:
+        log(f"NO LEFT FILES bucket={bucket_id}")
+        return
+
+    if not right_files:
+        log(f"NO RIGHT FILES bucket={bucket_id}")
+        return
+
+    con = duckdb.connect()
+
+    try:
+
+        con.execute(f"""
+            PRAGMA threads=4;
+        """)
+
+        left_drop_sql = ""
+        right_drop_sql = ""
+
+        if LEFT_DROP_COLS:
+            left_drop_sql = "," + ",".join(
+                [f'"{c}"' for c in LEFT_DROP_COLS]
+            )
+
+        if RIGHT_DROP_COLS:
+            right_drop_sql = "," + ",".join(
+                [f'"{c}"' for c in RIGHT_DROP_COLS]
+            )
+
+        query = f"""
+        COPY (
+            SELECT
+                l.* EXCLUDE ({",".join([f'"{c}"' for c in LEFT_DROP_COLS])}) ,
+                r.* EXCLUDE ({JOIN_KEY}{right_drop_sql})
+            FROM read_parquet({left_files}) l
+            {JOIN_TYPE.upper()} JOIN read_parquet({right_files}) r
+            ON l.{JOIN_KEY} = r.{JOIN_KEY}
+        )
+        TO '{output_file}'
+        (
+            FORMAT PARQUET,
+            COMPRESSION ZSTD,
+            ROW_GROUP_SIZE {ROW_GROUP_SIZE}
+        );
+        """
+
+        # fix empty exclude
+        if not LEFT_DROP_COLS:
+            query = query.replace(
+                f"l.* EXCLUDE () ,",
+                "l.*,"
+            )
+
+        if not RIGHT_DROP_COLS:
+            query = query.replace(
+                f'r.* EXCLUDE ({JOIN_KEY})',
+                f'r.* EXCLUDE ("{JOIN_KEY}")'
+            )
+
+        con.execute(query)
+
+        log(
+            f"DONE bucket={bucket_id} "
+            f"time={round(time.time()-start,2)}s"
+        )
+
+    except Exception as e:
+        log(f"ERROR bucket={bucket_id} -> {e}")
+
+    finally:
+        try:
+            con.close()
+        except:
+            pass
+
+        gc.collect()
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+
+    total_start = time.time()
+
+    left_buckets = get_bucket_paths(LEFT_ROOT)
+    right_buckets = get_bucket_paths(RIGHT_ROOT)
+
+    common_buckets = sorted(
+        set(left_buckets.keys()) &
+        set(right_buckets.keys())
+    )
+
+    log(f"COMMON BUCKETS = {len(common_buckets)}")
+
+    if not common_buckets:
+        log("NO COMMON BUCKETS FOUND")
+        return
+
+    futures = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+
+        for bucket_id in common_buckets:
+
+            futures.append(
+                ex.submit(
+                    merge_bucket,
+                    bucket_id,
+                    left_buckets[bucket_id],
+                    right_buckets[bucket_id]
+                )
+            )
+
+        for f in as_completed(futures):
+            f.result()
+
+    log("=" * 80)
+    log(f"ALL DONE IN {round(time.time()-total_start,2)}s")
+    log("=" * 80)
+
+if __name__ == "__main__":
+    main()
